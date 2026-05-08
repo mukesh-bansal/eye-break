@@ -8,7 +8,6 @@ INSTALL_DIR="$HOME/Library/EyeBreak"
 PLIST_PATH="$HOME/Library/LaunchAgents/com.mukesh.eyebreak.plist"
 LABEL="com.mukesh.eyebreak"
 INTERVAL_SECONDS="${EYE_BREAK_INTERVAL:-600}"   # default 10 min, override with env var
-PYTHON3="/usr/bin/python3"
 
 # 1. Pre-flight: macOS only
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -16,10 +15,50 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
     exit 1
 fi
 
-# 2. Pre-flight: system Python 3 with Tkinter
-if ! "$PYTHON3" -c "import tkinter" 2>/dev/null; then
-    echo "ERROR: $PYTHON3 cannot import tkinter"
-    echo "Try: xcode-select --install"
+# 2. Find a Python with a Tk that actually works on this macOS
+# (the system /usr/bin/python3 ships Tk 8.5, which is broken on macOS 26+)
+echo "Finding a Python with working Tk..."
+CANDIDATES=(
+    "${EYE_BREAK_PYTHON:-}"
+    "$HOME/anaconda3/bin/python3"
+    "$HOME/miniconda3/bin/python3"
+    "$HOME/miniforge3/bin/python3"
+    "/opt/homebrew/bin/python3.13"
+    "/opt/homebrew/bin/python3.12"
+    "/opt/homebrew/bin/python3.11"
+    "/usr/local/bin/python3.13"
+    "/usr/local/bin/python3.12"
+    "/usr/local/bin/python3.11"
+    "/usr/bin/python3"
+)
+
+PYTHON3=""
+for cand in "${CANDIDATES[@]}"; do
+    [[ -z "$cand" ]] && continue
+    [[ ! -x "$cand" ]] && continue
+    # Test: can the candidate import tkinter AND actually create a window?
+    if "$cand" -c "import tkinter; r=tkinter.Tk(); r.withdraw(); r.destroy()" 2>/dev/null; then
+        PYTHON3="$cand"
+        TK_VER="$("$cand" -c 'import tkinter; print(tkinter.TkVersion)' 2>/dev/null)"
+        echo "  ✓ Using $PYTHON3 (Tk $TK_VER)"
+        break
+    fi
+done
+
+if [[ -z "$PYTHON3" ]]; then
+    echo ""
+    echo "ERROR: no working Python found."
+    echo ""
+    echo "Eye Break needs a Python 3 with a working Tk on this macOS."
+    echo "On macOS 26+, /usr/bin/python3's Tk 8.5 is broken. Pick one:"
+    echo ""
+    echo "  Option A — install Anaconda  (recommended, easiest):"
+    echo "    https://www.anaconda.com/download (or 'brew install --cask anaconda')"
+    echo ""
+    echo "  Option B — brew Python with Tk:"
+    echo "    brew install python-tk@3.13"
+    echo ""
+    echo "Then re-run this installer."
     exit 1
 fi
 

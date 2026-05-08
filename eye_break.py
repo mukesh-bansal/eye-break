@@ -82,17 +82,28 @@ def in_active_hours(cfg):
 
 
 def already_showing():
-    """Skip if a popup is already on screen (prevents stacking)."""
+    """Skip if another popup is currently on screen.
+
+    PID-based: read the PID from the lock and check if the process is alive.
+    A stale lock (process died without releasing) is auto-cleared.
+    """
     if not LOCK_FILE.exists():
         return False
-    # Stale lock cleanup: if older than 5 minutes, ignore it
     try:
-        age = time.time() - LOCK_FILE.stat().st_mtime
-        if age > 300:
-            LOCK_FILE.unlink(missing_ok=True)
-            return False
-        return True
-    except OSError:
+        pid = int(LOCK_FILE.read_text().strip())
+    except (ValueError, OSError):
+        LOCK_FILE.unlink(missing_ok=True)
+        return False
+    # os.kill(pid, 0) raises ProcessLookupError if pid is dead.
+    try:
+        os.kill(pid, 0)
+        return True  # process alive — popup is up
+    except ProcessLookupError:
+        LOCK_FILE.unlink(missing_ok=True)
+        return False
+    except PermissionError:
+        # Some other user owns this PID — almost certainly not us. Treat as stale.
+        LOCK_FILE.unlink(missing_ok=True)
         return False
 
 
