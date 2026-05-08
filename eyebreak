@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# eyebreak — control the Eye Break service
+# Single CLI to start, stop, test, configure, and inspect the popup schedule.
+
+set -euo pipefail
+
+INSTALL_DIR="$HOME/Library/EyeBreak"
+PLIST_PATH="$HOME/Library/LaunchAgents/com.mukesh.eyebreak.plist"
+LABEL="com.mukesh.eyebreak"
+USER_DOMAIN="gui/$(id -u)"
+CONFIG_FILE="$INSTALL_DIR/config.json"
+LOG_FILE="$INSTALL_DIR/events.log"
+
+# Reach the same Python that's wired into the plist (so test-run matches scheduled run)
+get_python() {
+    if [[ -f "$PLIST_PATH" ]]; then
+        grep -A 3 ProgramArguments "$PLIST_PATH" \
+            | grep -oE '<string>/[^<]*python3[^<]*</string>' \
+            | head -1 | sed -E 's|<string>(.*)</string>|\1|'
+    fi
+}
+
+require_install() {
+    if [[ ! -f "$PLIST_PATH" ]] || [[ ! -f "$INSTALL_DIR/eye_break.py" ]]; then
+        echo "✗ Eye Break is not installed."
+        echo "  Run: bash <repo>/install.sh"
+        echo "  Or:  curl -fsSL https://raw.githubusercontent.com/mukesh-bansal/eye-break/main/install.sh | bash"
+        exit 1
+    fi
+}
+
+set_json_field() {
+    # set_json_field "$key" "$value"   (value is JSON literal, e.g. 60 or "\"foo\"")
+    local key="$1" val="$2"
+    /usr/bin/python3 - "$CONFIG_FILE" "$key" "$val" <<'PY'
+import json, sys
+path, key, val = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    cfg = json.load(f)
+# val arrives as a string; try to parse as JSON literal first, fall back to string
+try:
+    parsed = json.loads(val)
+except ValueError:
+    parsed = val
+# dotted keys: "active_hours.start"
+keys = key.split(".")
+d = cfg
+for k in keys[:-1]:
+    d = d.setdefault(k, {})
+d[keys[-1]] = parsed
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=False)
+PY
+}
+
+cmd="${1:-status}"
+shift || true
+
+case "$cmd" in
+    start)
+        require_install
+        launchctl bootstrap "$USER_DOMAIN" "$PLIST_PATH" 2>/dev/null \
+            || launchctl bootout "$USER_DOMAIN" "$PLIST_PATH" 2>/dev/null && \
+               launchctl bootstrap "$USER_DOMAIN" "$PLIST_PATH"
+        launchctl enable "$USER_DOMAIN/$LABEL" 2>/dev/null || true
+        interval=$(grep -A 1 StartInterval "$PLIST_PATH" | tail -1 | grep -oE '[0-9]+')
+        echo "✓ Started · firing every $interval seconds ($((interval / 60)) min)"
+        ;;
+
+    stop)
+        require_install
+        launchctl bootout "$USER_DOMAIN" "$PLIST_PATH" 2>/dev/null || \
+            launchctl unload "$PLIST_PATH" 2>/dev/null || true
+        echo "✓ Stopped (launchd job unloaded). Run 'eyebreak start' to resume."
+        ;;
+
+    restart)
+        require_install
+        launchctl bootout "$USER_DOMAIN" "$PLIST_PATH" 2>/dev/null || true
+        launchctl bootstrap "$USER_DOMAIN" "$PLIST_PATH"
+        echo "✓ Restarted."
+        ;;
+
+    test|now)
+        require_install
+        rm -f "$INSTALL_DIR/showing.lock"
+        # Use launchctl kickstart so the popup runs in launchd's detached session.
+        # If we just run python in background here, it gets reaped when this CLI exits.
+        # Probe by trying kickstart directly — exits 0 if loaded, 113 if not.
+        if launchctl kickstart "$USER_DOMAIN/$LABEL" 2>/dev/null; then
+            echo "✓ Triggered popup via launchd."
+        else
+            echo "✗ launchd job not loaded. Run: eyebreak start"
+            exit 1
+        fi
+        ;;
+
+    status|"")
+        require_install
+        # `launchctl list | grep` is unreliable when called from non-interactive shells.
+        # `launchctl print <domain/label>` returns 0 iff the job is loaded.
+        if launchctl print "$USER_DOMAIN/$LABEL" >/dev/null 2>&1; then
+            echo "● loaded"
+        else
+            echo "○ unloaded — run: eyebreak start"
+        fi
+        if [[ -f "$PLIST_PATH" ]]; then
+            interval=$(grep -A 1 StartInterval "$PLIST_PATH" | tail -1 | grep -oE '[0-9]+')
+            echo "  interval:    every ${interval}s ($((interval / 60)) min)"
+        fi
+        if [[ -f "$CONFIG_FILE" ]]; then
+            duration=$(/usr/bin/python3 -c "import json; print(json.load(open('$CONFIG_FILE'))['duration_seconds'])" 2>/dev/null)
+            echo "  duration:    ${duration}s on screen"
+            hours=$(/usr/bin/python3 -c "import json; c=json.load(open('$CONFIG_FILE'))['active_hours']; print(f'{c[\"start\"]:02d}:00 — {c[\"end\"]:02d}:00')" 2>/dev/null)
+            echo "  active:      $hours"
+            sound=$(/usr/bin/python3 -c "import json; print('on' if json.load(open('$CONFIG_FILE')).get('play_sound', True) else 'off')" 2>/dev/null)
+            echo "  sound:       $sound"
+        fi
+        py="$(get_python)"
+        echo "  python:      $py"
+        if [[ -f "$LOG_FILE" ]]; then
+            shown=$(grep -c "shown " "$LOG_FILE" 2>/dev/null || echo 0)
+            dismissed=$(grep -c "dismissed" "$LOG_FILE" 2>/dev/null || echo 0)
+            echo "  history:     $shown shown · $dismissed dismissed"
+            last=$(tail -1 "$LOG_FILE" 2>/dev/null)
+            [[ -n "$last" ]] && echo "  last event:  $last"
+        fi
+        echo ""
+        echo "  config:      $CONFIG_FILE"
+        echo "  log:         $LOG_FILE"
+        ;;
+
+    interval)
+        require_install
+        n="${1:-}"
+        [[ -z "$n" ]] && { echo "usage: eyebreak interval <seconds>     (e.g. 600 = 10 min)"; exit 1; }
+        # Update plist
+        /usr/bin/python3 - "$PLIST_PATH" "$n" <<'PY'
+import re, sys
+p, n = sys.argv[1], sys.argv[2]
+txt = open(p).read()
+txt = re.sub(r'(<key>StartInterval</key>\s*<integer>)\d+(</integer>)', r'\g<1>' + n + r'\g<2>', txt)
+open(p, "w").write(txt)
+PY
+        launchctl bootout "$USER_DOMAIN" "$PLIST_PATH" 2>/dev/null || true
+        launchctl bootstrap "$USER_DOMAIN" "$PLIST_PATH"
+        echo "✓ interval = ${n}s ($((n / 60)) min)"
+        ;;
+
+    duration)
+        require_install
+        n="${1:-}"
+        [[ -z "$n" ]] && { echo "usage: eyebreak duration <seconds>     (popup time on screen, default 60)"; exit 1; }
+        set_json_field "duration_seconds" "$n"
+        echo "✓ popup duration = ${n}s (next firing reflects this — no restart needed)"
+        ;;
+
+    hours)
+        require_install
+        s="${1:-}"; e="${2:-}"
+        [[ -z "$s" || -z "$e" ]] && { echo "usage: eyebreak hours <start> <end>     (24h, e.g. 'hours 7 23')"; exit 1; }
+        set_json_field "active_hours.start" "$s"
+        set_json_field "active_hours.end" "$e"
+        echo "✓ active hours = $s:00 — $e:00 (next firing reflects this)"
+        ;;
+
+    sound)
+        require_install
+        v="${1:-}"
+        case "$v" in
+            on|true|1)  set_json_field "play_sound" "true";  echo "✓ sound on" ;;
+            off|false|0) set_json_field "play_sound" "false"; echo "✓ sound off" ;;
+            *) echo "usage: eyebreak sound <on|off>"; exit 1 ;;
+        esac
+        ;;
+
+    config)
+        require_install
+        open "$CONFIG_FILE"
+        ;;
+
+    log)
+        require_install
+        if [[ "${1:-}" == "follow" ]]; then
+            tail -f "$LOG_FILE"
+        else
+            tail -50 "$LOG_FILE"
+        fi
+        ;;
+
+    uninstall)
+        require_install
+        bash "$INSTALL_DIR/uninstall.sh"
+        ;;
+
+    update)
+        # Pull latest from GitHub and reinstall
+        repo="${EYE_BREAK_REPO_RAW:-https://raw.githubusercontent.com/mukesh-bansal/eye-break/main}"
+        tmp="$(mktemp -d)"
+        echo "Fetching latest install.sh..."
+        curl -fsSL "$repo/install.sh" -o "$tmp/install.sh"
+        bash "$tmp/install.sh"
+        rm -rf "$tmp"
+        ;;
+
+    help|--help|-h)
+        cat <<'EOF'
+eyebreak — control the Eye Break service
+
+Lifecycle:
+  start                   Load the launchd job (auto-fires on schedule)
+  stop                    Unload the launchd job
+  restart                 Bounce the job
+  status                  Show running state, schedule, history (default if no command)
+  uninstall               Remove everything
+  update                  Pull latest version from GitHub and reinstall
+
+Run-now:
+  test  (or 'now')        Show a popup right now, ignoring schedule
+
+Configuration (changes take effect immediately):
+  interval <seconds>      Time between auto-popups   (default: 600 = 10 min)
+  duration <seconds>      How long popup stays open  (default: 60)
+  hours <start> <end>     Active hours, 24h          (default: 7 23, i.e. 7am–11pm)
+  sound <on|off>          Toggle the chime           (default: on)
+
+Inspection:
+  config                  Open config.json in default editor
+  log                     Show last 50 events
+  log follow              Tail events.log live
+
+Examples:
+  eyebreak start
+  eyebreak interval 1200          # every 20 minutes
+  eyebreak duration 30            # 30-second popup
+  eyebreak hours 9 22             # only 9am–10pm
+  eyebreak sound off
+  eyebreak now                    # see it right now
+  eyebreak status
+EOF
+        ;;
+
+    *)
+        echo "✗ unknown command: $cmd"
+        echo "Run 'eyebreak help' for usage."
+        exit 1
+        ;;
+esac
