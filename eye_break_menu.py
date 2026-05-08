@@ -38,6 +38,21 @@ HOURS_PRESETS = [
 
 
 # ─────────────────────────────────────────────────────────────────
+# Notification helper
+# ─────────────────────────────────────────────────────────────────
+# rumps.notification raises if the host Python lacks an Info.plist
+# CFBundleIdentifier (e.g. Anaconda's bare /bin/python3). Wrap so a
+# notification failure never breaks a callback.
+
+def _safe_notify(title, subtitle, message):
+    try:
+        rumps.notification(title, subtitle, message)
+    except Exception:
+        # Notifications are optional — silently swallow.
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────
 # Config helpers
 # ─────────────────────────────────────────────────────────────────
 
@@ -64,13 +79,19 @@ def load_config():
         return DEFAULT_CONFIG.copy()
 
 
-def save_config(cfg):
+def save_config(updates):
+    """Merge `updates` into config.json. Read-modify-write to preserve unrelated keys."""
     INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE) as f:
-        existing = json.load(f) if CONFIG_FILE.exists() else {}
-    existing = {**existing, **cfg}
+    existing = {}
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE) as f:
+                existing = json.load(f)
+        except Exception:
+            existing = {}
+    merged = {**existing, **updates}
     with open(CONFIG_FILE, "w") as f:
-        json.dump(existing, f, indent=2, ensure_ascii=False)
+        json.dump(merged, f, indent=2, ensure_ascii=False)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -289,16 +310,29 @@ class EyeBreakApp(rumps.App):
     # ── Callbacks ──
 
     def toggle_active(self, sender):
-        if launchd_loaded():
-            launchd_unload()
-            rumps.notification("Eye Break", "Disabled", "Popups will not fire until re-enabled.")
-        else:
-            # Make sure plist matches current config before loading
-            write_popup_plist(self._cfg["interval_minutes"])
-            launchd_load()
-            rumps.notification("Eye Break", "Enabled",
-                               f"Next popup at {next_fire_time(self._cfg['interval_minutes']).strftime('%H:%M')}")
-        self._refresh_state()
+        # Wrap the whole flow so a notification or transient launchd failure
+        # never locks the user out of toggling.
+        try:
+            if launchd_loaded():
+                launchd_unload()
+                _safe_notify("Eye Break", "Disabled", "Popups will not fire until re-enabled.")
+            else:
+                write_popup_plist(self._cfg["interval_minutes"])
+                launchd_load()
+                _safe_notify(
+                    "Eye Break", "Enabled",
+                    f"Next popup at {next_fire_time(self._cfg['interval_minutes']).strftime('%H:%M')}"
+                )
+        except Exception as e:
+            # Surface failures via alert (synchronous) — never silently swallow.
+            try:
+                rumps.alert("Eye Break — toggle failed",
+                            f"{type(e).__name__}: {e}\n\nCheck menu.stderr.log for details.")
+            except Exception:
+                pass
+        finally:
+            # ALWAYS refresh state so the menu reflects reality even on partial failure.
+            self._refresh_state()
 
     def test_now(self, sender):
         if not launchd_loaded():
@@ -314,8 +348,8 @@ class EyeBreakApp(rumps.App):
             write_popup_plist(minutes)
             if launchd_loaded():
                 launchd_load()  # reload to pick up new schedule
-            rumps.notification("Eye Break", "Interval changed",
-                               f"Now every {minutes} min on the calendar (:{', :'.join(f'{m:02d}' for m in calendar_interval_entries(minutes))})")
+            _safe_notify("Eye Break", "Interval changed",
+                         f"Now every {minutes} min on the calendar")
             self._refresh_state()
         return cb
 
@@ -323,7 +357,7 @@ class EyeBreakApp(rumps.App):
         def cb(sender):
             self._cfg["duration_seconds"] = seconds
             save_config({"duration_seconds": seconds})
-            rumps.notification("Eye Break", "Duration changed", f"Popup stays {seconds}s")
+            _safe_notify("Eye Break", "Duration changed", f"Popup stays {seconds}s")
             self._refresh_state()
         return cb
 
@@ -331,7 +365,7 @@ class EyeBreakApp(rumps.App):
         def cb(sender):
             self._cfg["active_hours"] = {"start": start, "end": end}
             save_config({"active_hours": {"start": start, "end": end}})
-            rumps.notification("Eye Break", "Active hours changed", f"{start:02d}:00 – {end:02d}:00")
+            _safe_notify("Eye Break", "Active hours changed", f"{start:02d}:00 – {end:02d}:00")
             self._refresh_state()
         return cb
 

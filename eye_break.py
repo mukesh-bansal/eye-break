@@ -339,8 +339,17 @@ def show_break_native(cfg):
     )
     content.addSubview_(countdown)
 
-    # Timer — keep strong refs in a list so Python doesn't GC them
-    # while AppKit still holds them.
+    # ── Footer hint: how to skip ──
+    hint = _label(
+        ((0, 12), (sw, 22)),
+        "press ESC or SPACE to skip · you'll be asked to confirm",
+        _mono_font(13),
+        muted_color,
+    )
+    content.addSubview_(hint)
+
+    # ── Timer ──
+    # Strong refs in a list so Python doesn't GC them while AppKit holds them.
     _retained = []
     handler = TimerHandler.alloc().init()
     handler.remaining = cfg["duration_seconds"]
@@ -350,10 +359,53 @@ def show_break_native(cfg):
     )
     _retained.append(handler)
     _retained.append(timer)
+
+    # ── Skip-with-confirmation handler ──
+    # ESC / SPACE / RETURN → show NSAlert. If user confirms skip, stop the app.
+    # If they cancel, popup keeps running.
+    from AppKit import NSAlert, NSAlertFirstButtonReturn
+
+    def confirm_skip():
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_("Are you sure you want to skip?")
+        alert.setInformativeText_(
+            "Take 60 seconds for your eyes:\n"
+            "  ·  Inhale 4 sec through nose\n"
+            "  ·  Hold 4 sec\n"
+            "  ·  Exhale 6 sec through mouth\n"
+            "  ·  Look 20 ft away while breathing\n\n"
+            "This break is for future-you. Honor it."
+        )
+        # First button is the default (ENTER). We make it the "stay" option
+        # so reflexive ENTER-mashing doesn't skip the break.
+        alert.addButtonWithTitle_("I'll take the break")
+        alert.addButtonWithTitle_("Skip anyway")
+        # Bring the alert above the fullscreen popup
+        alert.window().setLevel_(NSScreenSaverWindowLevel + 2)
+        response = alert.runModal()
+        if response != NSAlertFirstButtonReturn:
+            # Skip anyway
+            log("dismissed reason=skip_confirmed")
+            _stop_app()
+        else:
+            log("skip_cancelled")
+            # Return to popup. Window may need to be refocused.
+            window.makeKeyAndOrderFront_(None)
+            NSApp.activateIgnoringOtherApps_(True)
+
+    def key_handler(event):
+        if event.keyCode() in (53, 49, 36):  # ESC, SPACE, RETURN
+            confirm_skip()
+            return None  # consume
+        return event
+
+    km = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+        NSEventMaskKeyDown, key_handler
+    )
+    _retained.extend([km, key_handler, confirm_skip])
+
+    # Hold strong refs at module level (extra-safe — PyObjC GC is finicky)
     show_break_native._retained = _retained
-    # Note: dismissal is timer-only (no key/click handlers). Local event monitors
-    # caused PyObjC GC crashes in testing. Duration is always honored — set a
-    # short duration in config.json if you want quicker dismiss.
 
     log(f"shown duration={cfg['duration_seconds']}")
     play_chime(cfg)
